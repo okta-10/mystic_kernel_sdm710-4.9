@@ -214,4 +214,4 @@ source "drivers/nfc/pn553-i2c/Kconfig"
 source "drivers/nfc/p73-spi/Kconfig"
 
 
-endmenu
+source "drivers/energy_model/Kconfig"
