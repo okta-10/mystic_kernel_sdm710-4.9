@@ -23,6 +23,9 @@ config IOSCHED_DEADLINE
 
 config IOSCHED_MAPLE
 	tristate "Maple I/O scheduler"
+
+config IOSCHED_TRIPNDROID
+	tristate "Tripndroid I/O scheduler"
 	default y
 
 config IOSCHED_CFQ
@@ -153,6 +156,9 @@ choice
 	config DEFAULT_MAPLE
 		bool "Maple" if IOSCHED_MAPLE=y
 
+	config DEFAULT_TRIPNDROID
+		bool "Tripndroid" if IOSCHED_TRIPNDROID=y
+
 	config DEFAULT_FIFO
 		bool "FIFO" if IOSCHED_FIFO=y
 
@@ -171,6 +177,7 @@ config DEFAULT_IOSCHED
 	default "fiops" if DEFAULT_FIOPS
 	default "sio" if DEFAULT_SIO
 	default "maple" if DEFAULT_MAPLE
+	default "tripndroid" if DEFAULT_TRIPNDROID
 	default "fifo" if DEFAULT_FIFO
 	default "zen" if DEFAULT_ZEN
 
