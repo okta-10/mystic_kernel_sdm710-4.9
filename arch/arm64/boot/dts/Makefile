@@ -23,11 +23,6 @@
 #dts-dirs += lg
 #dts-dirs += zte
 #else
-dts-dirs += 18081
-dts-dirs += 18181
-dts-dirs += 18097
-dts-dirs += 18383
-dts-dirs += 18041
 dts-dirs += 19651
 #endif
 
