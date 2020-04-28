@@ -427,6 +427,14 @@ struct sde_crtc_state {
 	bool sbuf_clk_shifted;
 
 	struct sde_crtc_respool rp;
+
+#ifdef VENDOR_EDIT
+/*liping-m@PSW.MM.Display.Service.Feature,2018/9/26,for OnScreenFingerprint feature*/
+	bool fingerprint_mode;
+	bool fingerprint_pressed;
+	bool fingerprint_defer_sync;
+	struct sde_hw_dim_layer *fingerprint_dim_layer;
+#endif
 };
 
 enum sde_crtc_irq_state {
@@ -566,11 +574,11 @@ struct drm_crtc *sde_crtc_init(struct drm_device *dev, struct drm_plane *plane);
 int sde_crtc_post_init(struct drm_device *dev, struct drm_crtc *crtc);
 
 /**
- * sde_crtc_complete_flip - complete flip for clients
+ * sde_crtc_cancel_pending_flip - complete flip for clients on lastclose
  * @crtc: Pointer to drm crtc object
  * @file: client to cancel's file handle
  */
-void sde_crtc_complete_flip(struct drm_crtc *crtc, struct drm_file *file);
+void sde_crtc_cancel_pending_flip(struct drm_crtc *crtc, struct drm_file *file);
 
 /**
  * sde_crtc_register_custom_event - api for enabling/disabling crtc event

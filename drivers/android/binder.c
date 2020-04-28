@@ -73,6 +73,15 @@
 #include "binder_alloc.h"
 #include "binder_trace.h"
 
+#ifdef VENDOR_EDIT
+// Liujie.Xie@TECH.Kernel.Sched, 2019/05/22, add for ui first
+#include <linux/oppocfs/oppo_cfs_binder.h>
+#endif
+
+#if defined(VENDOR_EDIT) && defined(CONFIG_OPPO_HANS)
+// Kun.Zhou@ROM.Framework, 2019/09/23, add for hans freeze manager
+#include <linux/hans.h>
+#endif
 static HLIST_HEAD(binder_deferred_list);
 static DEFINE_MUTEX(binder_deferred_lock);
 
@@ -525,8 +534,7 @@ struct binder_priority {
  * @requested_threads_started: number binder threads started
  *                        (protected by @inner_lock)
  * @tmp_ref:              temporary reference to indicate proc is in use
- *                        (atomic since @proc->inner_lock cannot
- *                        always be acquired)
+ *                        (protected by @inner_lock)
  * @default_priority:     default scheduler priority
  *                        (invariant after initialized)
  * @debugfs_entry:        debugfs node
@@ -560,7 +568,7 @@ struct binder_proc {
 	int max_threads;
 	int requested_threads;
 	int requested_threads_started;
-	atomic_t tmp_ref;
+	int tmp_ref;
 	struct binder_priority default_priority;
 	struct dentry *debugfs_entry;
 	struct binder_alloc alloc;
@@ -2071,9 +2079,9 @@ static void binder_thread_dec_tmpref(struct binder_thread *thread)
 static void binder_proc_dec_tmpref(struct binder_proc *proc)
 {
 	binder_inner_proc_lock(proc);
-	atomic_dec(&proc->tmp_ref);
+	proc->tmp_ref--;
 	if (proc->is_dead && RB_EMPTY_ROOT(&proc->threads) &&
-			!atomic_read(&proc->tmp_ref)) {
+			!proc->tmp_ref) {
 		binder_inner_proc_unlock(proc);
 		binder_free_proc(proc);
 		return;
@@ -2135,26 +2143,8 @@ static struct binder_thread *binder_get_txn_from_and_acq_inner(
 
 static void binder_free_transaction(struct binder_transaction *t)
 {
-	struct binder_proc *target_proc;
-
-	spin_lock(&t->lock);
-	target_proc = t->to_proc;
-	if (target_proc) {
-		atomic_inc(&target_proc->tmp_ref);
-		spin_unlock(&t->lock);
-
-		binder_inner_proc_lock(target_proc);
-		if (t->buffer)
-			t->buffer->transaction = NULL;
-		binder_inner_proc_unlock(target_proc);
-		binder_proc_dec_tmpref(target_proc);
-	} else {
-		/*
-		 * If the transaction has no target_proc, then
-		 * t->buffer->transaction * has already been cleared.
-		 */
-		spin_unlock(&t->lock);
-	}
+	if (t->buffer)
+		t->buffer->transaction = NULL;
 	kfree(t);
 	binder_stats_deleted(BINDER_STAT_TRANSACTION);
 }
@@ -2938,6 +2928,12 @@ static bool binder_proc_transaction(struct binder_transaction *t,
 		binder_transaction_priority(thread->task, t, node_prio,
 					    node->inherit_rt);
 		binder_enqueue_thread_work_ilocked(thread, &t->work);
+#ifdef VENDOR_EDIT
+// Liujie.Xie@TECH.Kernel.Sched, 2019/05/22, add for ui first
+        if (!oneway) {
+            binder_thread_check_and_set_dynamic_ux(thread->task, t->from->task);
+        }
+#endif
 	} else if (!pending_async) {
 		binder_enqueue_work_ilocked(&t->work, &proc->todo);
 	} else {
@@ -2986,7 +2982,7 @@ static struct binder_node *binder_get_node_refs_for_txn(
 		target_node = node;
 		binder_inc_node_nilocked(node, 1, 0, NULL);
 		binder_inc_node_tmpref_ilocked(node);
-		atomic_inc(&node->proc->tmp_ref);
+		node->proc->tmp_ref++;
 		*procp = node->proc;
 	} else
 		*error = BR_DEAD_REPLY;
@@ -2994,6 +2990,58 @@ static struct binder_node *binder_get_node_refs_for_txn(
 
 	return target_node;
 }
+
+#if defined(VENDOR_EDIT) && defined(CONFIG_ELSA_STUB)
+//huangliang@Swdp2.shanghai, 2018/03/30, parse parcel data to get descriptor
+#define STRICT_MODE_PENALTY_GATHER 				0x40
+#define STRICT_MODE_PENALTY_GATHER_OFFSET		2
+#define LENGTH_OFFSET							4
+#define DESCRIPTOR_OFFSET						8
+#define BUFFER_LENGTH							140
+/*
+* Parcel data format,   littel Endien
+  first int32   (0x40 << 16)
+  second int32  is Descripter length
+  Descripter be writen by String16 format
+											    Parcel(
+0x00000000: 00400000 00000029 006f0063 002e006d '..@.)...c.o.m...'
+0x00000010: 006e0061 00720064 0069006f 002e0064 'a.n.d.r.o.i.d...'
+0x00000020: 006e0069 00650074 006e0072 006c0061 'i.n.t.e.r.n.a.l.'
+0x00000030: 0074002e 006c0065 00700065 006f0068 '..t.e.l.e.p.h.o.'
+0x00000040: 0079006e 0049002e 00650054 0065006c 'n.y...I.T.e.l.e.'
+0x00000050: 00680070 006e006f 00000079 00000001 'p.h.o.n.y.......')
+*/
+
+void parse_parcel(struct binder_transaction_data *tr, char *out_buf)
+{
+	char buf[BUFFER_LENGTH];
+	int loop_count;
+	int i = 0;
+
+	if (!copy_from_user(buf, (char*)tr->data.ptr.buffer,
+                (tr->data_size>BUFFER_LENGTH)?BUFFER_LENGTH:tr->data_size)) {
+		if (buf[STRICT_MODE_PENALTY_GATHER_OFFSET] == STRICT_MODE_PENALTY_GATHER) {
+			/*check descriptor length wether override buf len*/
+			if (buf[LENGTH_OFFSET] * 2 >= BUFFER_LENGTH - DESCRIPTOR_OFFSET) {
+				loop_count = BUFFER_LENGTH-DESCRIPTOR_OFFSET;
+			} else {
+				loop_count = buf[LENGTH_OFFSET] * 2;
+			}
+
+			/*move descriptor character*/
+			for (i = 0; i < loop_count; i++) {
+				if (i % 2 == 0) {
+					buf[DESCRIPTOR_OFFSET + i / 2] = buf[DESCRIPTOR_OFFSET + i];
+				}
+			}
+			buf[DESCRIPTOR_OFFSET + loop_count / 2] = '\0';
+			memcpy(out_buf, &buf[DESCRIPTOR_OFFSET], loop_count / 2 + 1);
+		}
+	}
+
+}
+
+#endif
 
 static void binder_transaction(struct binder_proc *proc,
 			       struct binder_thread *thread,
@@ -3021,7 +3069,19 @@ static void binder_transaction(struct binder_proc *proc,
 	int t_debug_id = atomic_inc_return(&binder_last_id);
 	char *secctx = NULL;
 	u32 secctx_sz = 0;
-
+#if defined(VENDOR_EDIT) && defined(CONFIG_ELSA_STUB)
+//zhoumingjun@Swdp.shanghai, 2017/07/10, notify user space when binder transaction starts
+	struct process_event_data pe_data;
+	struct process_event_binder pe_binder;
+#endif
+#if defined(VENDOR_EDIT) && defined(CONFIG_OPPO_HANS)
+// Kun.Zhou@ROM.Framework, 2019/09/23, add for hans freeze manager
+	char buf_data[INTERFACETOKEN_BUFF_SIZE];
+	size_t buf_data_size;
+	char buf[INTERFACETOKEN_BUFF_SIZE] = {0};
+	int i = 0;
+	int j = 0;
+#endif
 	e = binder_transaction_log_add(&binder_transaction_log);
 	e->debug_id = t_debug_id;
 	e->call_type = reply ? 2 : !!(tr->flags & TF_ONE_WAY);
@@ -3031,6 +3091,11 @@ static void binder_transaction(struct binder_proc *proc,
 	e->data_size = tr->data_size;
 	e->offsets_size = tr->offsets_size;
 	e->context_name = proc->context->name;
+
+#ifdef VENDOR_EDIT
+// Liujie.Xie@TECH.Kernel.Sched, 2019/05/22, add for ui first
+    binder_thread_check_and_remove_dynamic_ux(thread->task);
+#endif
 
 	if (reply) {
 		binder_inner_proc_lock(proc);
@@ -3083,7 +3148,7 @@ static void binder_transaction(struct binder_proc *proc,
 			goto err_dead_binder;
 		}
 		target_proc = target_thread->proc;
-		atomic_inc(&target_proc->tmp_ref);
+		target_proc->tmp_ref++;
 		binder_inner_proc_unlock(target_thread->proc);
 	} else {
 		if (tr->target.handle) {
@@ -3136,6 +3201,17 @@ static void binder_transaction(struct binder_proc *proc,
 			return_error_line = __LINE__;
 			goto err_dead_binder;
 		}
+
+#if defined(VENDOR_EDIT) && defined(CONFIG_OPPO_HANS)
+// Kun.Zhou@ROM.Framework, 2019/09/23, add for hans freeze manager
+		if (!(tr->flags & TF_ONE_WAY) //report sync binder call
+			&& target_proc
+			&& (task_uid(target_proc->tsk).val > MIN_USERAPP_UID)
+			&& (proc->pid != target_proc->pid)
+			&& is_frozen_tg(target_proc->tsk)) {
+			hans_report(SYNC_BINDER, task_tgid_nr(proc->tsk), task_uid(target_proc->tsk).val, "SYNC_BINDER", -1);
+		}
+#endif
 		e->to_node = target_node->debug_id;
 		if (security_binder_transaction(proc->tsk,
 						target_proc->tsk) < 0) {
@@ -3345,12 +3421,37 @@ static void binder_transaction(struct binder_proc *proc,
 		return_error_line = __LINE__;
 		goto err_bad_offset;
 	}
+#if defined(VENDOR_EDIT) && defined(CONFIG_OPPO_HANS)
+// Kun.Zhou@ROM.Framework, 2019/09/23, add for hans freeze manager
+	if ((tr->flags & TF_ONE_WAY) //report async binder call
+		&& target_proc
+		&& (task_uid(target_proc->tsk).val > MIN_USERAPP_UID)
+		&& (proc->pid != target_proc->pid)
+		&& is_frozen_tg(target_proc->tsk)) {
+		buf_data_size = tr->data_size>INTERFACETOKEN_BUFF_SIZE ?INTERFACETOKEN_BUFF_SIZE:tr->data_size;
+		if (!copy_from_user(buf_data, (char*)tr->data.ptr.buffer, buf_data_size)) {
+			//1.skip first PARCEL_OFFSET bytes (useless data)
+			//2.make sure the invalid address issue is not occuring(j =PARCEL_OFFSET+1, j+=2)
+			//3.java layer uses 2 bytes char. And only the first bytes has the data.(p+=2)
+			if (buf_data_size > PARCEL_OFFSET) {
+				char *p = (char *)(buf_data) + PARCEL_OFFSET;
+				j = PARCEL_OFFSET + 1;
+				while (i < INTERFACETOKEN_BUFF_SIZE && j < buf_data_size && *p != '\0') {
+					buf[i++] = *p;
+					j += 2;
+					p += 2;
+				}
+				if (i == INTERFACETOKEN_BUFF_SIZE) buf[i-1] = '\0';
+			}
+			hans_report(ASYNC_BINDER, task_tgid_nr(proc->tsk), task_uid(target_proc->tsk).val, buf, tr->code);
+		}
+	}
+#endif
 	off_start_offset = ALIGN(tr->data_size, sizeof(void *));
 	buffer_offset = off_start_offset;
 	off_end_offset = off_start_offset + tr->offsets_size;
 	sg_buf_offset = ALIGN(off_end_offset, sizeof(void *));
-	sg_buf_end_offset = sg_buf_offset + extra_buffers_size -
-		ALIGN(secctx_sz, sizeof(u64));
+	sg_buf_end_offset = sg_buf_offset + extra_buffers_size;
 	off_min = 0;
 	for (buffer_offset = off_start_offset; buffer_offset < off_end_offset;
 	     buffer_offset += sizeof(binder_size_t)) {
@@ -3540,7 +3641,28 @@ static void binder_transaction(struct binder_proc *proc,
 	}
 	tcomplete->type = BINDER_WORK_TRANSACTION_COMPLETE;
 	t->work.type = BINDER_WORK_TRANSACTION;
+#if defined(VENDOR_EDIT) && defined(CONFIG_ELSA_STUB)
+//zhoumingjun@Swdp.shanghai, 2017/07/10, notify user space when binder transaction starts
+	if (target_proc->tsk != NULL) {
+		pe_binder.src = proc->tsk;
+		pe_binder.dst = target_proc->tsk;
+		pe_binder.code = tr->code;
+		pe_binder.flags = tr->flags;
 
+		pe_data.pid = target_proc->pid;
+		pe_data.uid = task_uid(target_proc->tsk);
+		pe_data.reason = proc->pid;
+		pe_data.reason2 = t->code;
+		pe_data.binder_flag = tr->flags;
+		pe_data.priv = &pe_binder;
+		memset(pe_data.buf, 0, BINDER_DESCRIPTOR_SIZE);
+		parse_parcel(tr,pe_data.buf);
+		pe_data.freeze_binder_count = 0;
+		process_event_notifier_call_chain_atomic(PROCESS_EVENT_BINDER, &pe_data);
+	} else {
+		binder_user_error("do not process_event_notifier_call_chain_atomic, target_proc->tsk == NULL");
+	}
+#endif
 	if (reply) {
 		binder_enqueue_thread_work(thread, tcomplete);
 		binder_inner_proc_lock(target_proc);
@@ -3863,12 +3985,10 @@ static int binder_thread_write(struct binder_proc *proc,
 				     buffer->debug_id,
 				     buffer->transaction ? "active" : "finished");
 
-			binder_inner_proc_lock(proc);
 			if (buffer->transaction) {
 				buffer->transaction->buffer = NULL;
 				buffer->transaction = NULL;
 			}
-			binder_inner_proc_unlock(proc);
 			if (buffer->async_transaction && buffer->target_node) {
 				struct binder_node *buf_node;
 				struct binder_work *w;
@@ -4198,7 +4318,15 @@ static int binder_wait_for_work(struct binder_thread *thread,
 			list_add(&thread->waiting_thread_node,
 				 &proc->waiting_threads);
 		binder_inner_proc_unlock(proc);
-		schedule();
+#if defined(VENDOR_EDIT) && defined(CONFIG_OPPO_HEALTHINFO)
+// Liujie.Xie@TECH.Kernel.Sched, 2019/08/29, add for stuck monitor
+        current->in_binder = 1;
+#endif
+        schedule();
+#if defined(VENDOR_EDIT) && defined(CONFIG_OPPO_HEALTHINFO)
+// Liujie.Xie@TECH.Kernel.Sched, 2019/08/29, add for stuck monitor
+        current->in_binder = 0;
+#endif
 		binder_inner_proc_lock(proc);
 		list_del_init(&thread->waiting_thread_node);
 		if (signal_pending(current)) {
@@ -4491,6 +4619,10 @@ retry:
 			trd->sender_pid =
 				task_tgid_nr_ns(sender,
 						task_active_pid_ns(current));
+#ifdef VENDOR_EDIT
+// Liujie.Xie@TECH.Kernel.Sched, 2019/05/22, add for ui first
+            binder_thread_check_and_set_dynamic_ux(thread->task, t_from->task);
+#endif
 		} else {
 			trd->sender_pid = 0;
 		}
@@ -4728,7 +4860,7 @@ static int binder_thread_release(struct binder_proc *proc,
 	 * The corresponding dec is when we actually
 	 * free the thread in binder_free_thread()
 	 */
-	atomic_inc(&proc->tmp_ref);
+	proc->tmp_ref++;
 	/*
 	 * take a ref on this thread to ensure it
 	 * survives while we are releasing it
@@ -5223,7 +5355,6 @@ static int binder_open(struct inode *nodp, struct file *filp)
 		return -ENOMEM;
 	spin_lock_init(&proc->inner_lock);
 	spin_lock_init(&proc->outer_lock);
-	atomic_set(&proc->tmp_ref, 0);
 	get_task_struct(current->group_leader);
 	proc->tsk = current->group_leader;
 	mutex_init(&proc->files_lock);
@@ -5403,7 +5534,7 @@ static void binder_deferred_release(struct binder_proc *proc)
 	 * Make sure proc stays alive after we
 	 * remove all the threads
 	 */
-	atomic_inc(&proc->tmp_ref);
+	proc->tmp_ref++;
 
 	proc->is_dead = true;
 	threads = 0;
@@ -5951,6 +6082,122 @@ static int binder_state_show(struct seq_file *m, void *unused)
 
 	return 0;
 }
+
+#if defined(VENDOR_EDIT) && defined(CONFIG_ELSA_STUB)
+//huangliang@Swdp.shanghai, 2018/08/14, chk pid whether going binder transaction
+static int is_proc_thread_in_transaction(struct binder_thread *thread)
+{
+	struct binder_transaction *t;
+	int ret = 0;
+
+	if (thread->transaction_stack == NULL)
+		return ret;
+	t = thread->transaction_stack;
+	if (t->from == thread || t->to_thread == thread) {
+		ret = 1;
+	}
+	return ret;
+}
+
+static int is_proc_in_transaction(struct binder_proc * proc)
+{
+	int ret = 0;
+	struct rb_node *n;
+	binder_inner_proc_lock(proc);
+	for (n = rb_first(&proc->threads); n != NULL; n = rb_next(n)) {
+		ret = is_proc_thread_in_transaction(rb_entry(n, struct binder_thread,rb_node));
+		if (ret == 1) {
+			break;
+		}
+	}
+
+	binder_inner_proc_unlock(proc);
+	return ret;
+}
+
+int chk_proc_binder_transaction(uid_t uid)
+{
+	struct binder_proc *proc;
+	int ret = 0;
+	mutex_lock(&binder_procs_lock);
+	hlist_for_each_entry(proc, &binder_procs, proc_node) {
+		if (uid == __kuid_val(task_uid(proc->tsk))) {
+			ret = is_proc_in_transaction(proc);
+			if (ret == 1)
+				break;
+		}
+	}
+	mutex_unlock(&binder_procs_lock);
+	return ret;
+}
+EXPORT_SYMBOL(chk_proc_binder_transaction);
+#endif
+
+#if defined(VENDOR_EDIT) && defined(CONFIG_OPPO_HANS)
+// Kun.Zhou@ROM.Framework, 2019/09/23, add for hans freeze manager
+static void hans_check_uid_proc_status(struct binder_proc *proc)
+{
+	struct rb_node *n = NULL;
+	struct binder_thread *thread = NULL;
+	int uid = -1;
+	struct binder_transaction *btrans = NULL;
+	bool empty = true;
+
+	//check binder_thread/transaction_stack/binder_proc ongoing transaction
+	binder_inner_proc_lock(proc);
+	for (n = rb_first(&proc->threads); n != NULL; n = rb_next(n)) {
+		thread = rb_entry(n, struct binder_thread, rb_node);
+		empty = binder_worklist_empty_ilocked(&thread->todo);
+
+		if (thread->task != NULL) {
+			// has "todo" binder thread in worklist?
+			uid = task_uid(thread->task).val;
+			if (!empty) {
+				binder_inner_proc_unlock(proc);
+				hans_report(FROZEN_TRANS, -1, uid, "FROZEN_TRANS_THREAD", -1);
+				return;
+			}
+
+			// has transcation in transaction_stack?
+			btrans = thread->transaction_stack;
+			if (btrans) {
+				spin_lock(&btrans->lock);
+				if (btrans->to_thread == thread) {
+					// only report incoming binder call
+					spin_unlock(&btrans->lock);
+					binder_inner_proc_unlock(proc);
+					hans_report(FROZEN_TRANS, -1, uid, "FROZEN_TRANS_STACK", -1);
+					return;
+				}
+				spin_unlock(&btrans->lock);
+			}
+		}
+	}
+
+	// has "todo" binder proc in worklist
+	empty = binder_worklist_empty_ilocked(&proc->todo);
+	if (proc->tsk != NULL && !empty) {
+		uid = task_uid(proc->tsk).val;
+		binder_inner_proc_unlock(proc);
+		hans_report(FROZEN_TRANS, -1, uid, "FROZEN_TRANS_PROC", -1);
+		return;
+	}
+	binder_inner_proc_unlock(proc);
+}
+
+void hans_check_frozen_transcation(uid_t uid)
+{
+	struct binder_proc *proc;
+
+	mutex_lock(&binder_procs_lock);
+	hlist_for_each_entry(proc, &binder_procs, proc_node) {
+		if (proc != NULL && (task_uid(proc->tsk).val == uid)) {
+			hans_check_uid_proc_status(proc);
+		}
+	}
+	mutex_unlock(&binder_procs_lock);
+}
+#endif
 
 static int binder_stats_show(struct seq_file *m, void *unused)
 {
